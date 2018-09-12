@@ -1,0 +1,617 @@
+---
+title: "warmup_915"
+author: "xuefei.qin"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M:%S')`"
+output: 
+ html_document:
+    code_folding: hide
+    number_sections: true
+    toc: true
+    toc_float:  
+        collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = '~/Rworkfile/warm_up_coupon/all-vender/')
+options(scipen = 15) 
+## Environment settings 
+options(java.parameters = "-Xmx8g") 
+library(DBI) 
+library(rJava) 
+library(RJDBC) 
+# library(Hmisc) 
+library(dplyr) 
+library(stringr) 
+library(data.table) 
+library(ggplot2)
+library(scales)
+library(plotly)
+library(reshape)
+library(tidyr)
+library(lubridate)
+library(readxl)
+history_data.source <- 1
+data.source <- 0
+if (data.source == 0) {
+    source('~/Rworkfile/baseconn.R')
+}
+
+```
+
+```{r fetch data from database}
+#各商家的预热活动
+activities <- read.csv('coupon_sent_summary.csv', header = T, na.strings = '') %>%
+    mutate(start_time1 = ymd_hms(start),
+           end_time1 = ymd_hms(end))
+    
+times <- activities %>%
+    select(activity, vender_id, start_time1, end_time1) %>%
+    unique()
+
+#fetch data from database
+
+# 先把历史下单用户找出来，这部分数据只需要跑一次
+
+if(history_data.source == 0) {
+    #获取商家的名字
+    vender_name.sql <- "SELECT id, vender_name
+                        from dmall_oop.vender"
+    
+    vender_name <- dbGetQuery(conn, vender_name.sql)
+    
+    fwrite(vender_name, file = 'vender_name.csv')
+    
+    for ( i in 1:nrow(times)) {
+        # print(Sys.time())
+         # i <- 16
+        activity_s = times$activity[i]
+        vender_id_s = times$vender_id[i]
+        start_time <- as.character(times$start_time1[i]) 
+        base_day <- substr(start_time, 1,10)
+        # print(i)
+        
+        users_mark.sql <- sprintf("SELECT '%s' as activity,
+                                            vender_id,
+                                            webuser_id,
+                                            '%s' base_day,
+                                            to_date(max(order_create_time)) last_order_date
+                                    FROM dmall_order.wm_order
+                                    WHERE vender_id = %s
+                                        and order_type = 1
+                                        AND sale_type < 3
+                                        AND dt >= '20150101'
+                                        AND order_status <> 128
+                                        AND order_create_time <= '%s'
+                                    GROUP BY '%s',vender_id,
+                                             webuser_id,
+                                             '%s'", activity_s, base_day, 
+                                   vender_id_s, start_time, activity_s, base_day)
+        # writeLines(users_mark.sql)
+        users_mark_data <- dbGetQuery(conn, users_mark.sql)
+        users_mark_data2 <- users_mark_data %>%
+            mutate(interval_days = as.numeric(ymd(base_day) - ymd(last_order_date)),
+                   mark = case_when(interval_days <= 30 ~ '0-30' ,
+                                interval_days <= 60 ~ '31-60',
+                                interval_days <= 90 ~ '61-90',
+                                interval_days >90 ~ '90_beyond'))
+        if (i == 1) {
+            
+            fwrite(users_mark_data2, file = 'users_mark_data2.csv')
+            
+        } else {
+            
+            fwrite(users_mark_data2, file = 'users_mark_data2.csv', append = T)
+            
+        }
+        
+        
+    }
+    
+} 
+    
+vender_name <- fread("vender_name.csv", na.strings = '', encoding = 'UTF-8')
+users_mark_data2 <-  fread('users_mark_data2.csv', na.strings = '', 
+                               encoding = 'UTF-8',showProgress = F) %>%
+        unique() %>%
+        left_join(vender_name, by = c("vender_id" = 'id'))
+    
+
+# 每天的DAU和领券数据
+if (data.source == 0) {
+    
+    #预热期间的DAU
+    for ( i in 1:nrow(times)) {
+         # i <- 16
+        # print(Sys.time())
+        activity_s = times$activity[i]
+        vender_id_s = times$vender_id[i]
+        start_time <- as.character(times$start_time1[i]) 
+        end_time <- as.character(times$end_time1[i]) 
+        dt_begin <-  gsub('-', '', as.Date(start_time) - 1)
+        dt_end <-  gsub('-', '', as.Date(end_time) + 1)
+        task_id_list <- activities %>%
+            filter(vender_id == vender_id_s, activity == activity_s) %>%
+            select(task_id)
+        # print(i)
+        #日活，用户拿明细数据，方便给用户打标（新老用户）
+        DAU.sql <- sprintf("SELECT '%s' activity,
+                                   %s vender_id,
+                                   user_id,
+                                   to_date(receive_time) receive_date
+                            FROM dmall_dm_userprofile.events a
+                            LEFT JOIN dm_data.dim_store b ON a.store_id = cast(b.store_id AS string)
+                            WHERE dt >= '%s'
+                              and dt <= '%s'
+                              AND a.receive_time BETWEEN '%s' AND '%s'
+                              and a.page_title not in ('click_address',
+                                                        'click_message',
+                                                        'click_all',
+                                                        '自由购',
+                                                        '会员码',
+                                                        '扫一扫')
+                              and a.event_code not in ('app_push_reach',
+                                                        'wxmini_pv',
+                                                        'wxmini_click')
+                              and  b.vender_id = %s
+                           group by '%s',%s ,user_id, to_date(receive_time)",
+                           activity_s,vender_id_s, 
+                           dt_begin, dt_end, start_time, end_time, 
+                           vender_id_s, activity_s,vender_id_s)
+         # writeLines(DAU.sql)
+         dau_original <- try(dbGetQuery(conn, DAU.sql), silent = T)
+         
+         if (class(dau_original) == 'try-error'){
+            fwrite(dau_original, file = 'error_message.txt')
+             
+         }
+         # test_dau  <- dbGetQuery(conn, DAU.sql)
+         #领券的用户，也是明细数据。
+         click_coupon_users.sql <- sprintf("select '%s' activity, 
+                                                   %s vender_id,
+                                                    user_id, 
+                                                    to_date(created) create_dat
+                                            FROM dmall_pandora.user_tasks_reward
+                                            WHERE task_id IN (%s)
+                                              AND dt >= '%s'
+                                              and dt <= '%s'
+                                              AND created >= '%s'
+                                              AND created <= '%s'
+                                              and status = 1
+                                            group by '%s',%s, user_id, to_date(created)
+                                ",
+                                activity_s, vender_id_s, 
+                                paste(task_id_list$task_id, collapse = ','),
+                                dt_begin, dt_end, start_time, end_time, activity_s,
+                                vender_id_s)
+
+         # writeLines(click_coupon_users.sql)
+         click_coupon_users_original <- try(dbGetQuery(conn, click_coupon_users.sql),silent = T)
+         if (class(click_coupon_users_original) == 'try-error'){
+            fwrite(click_coupon_users_original, file = 'error_message1.txt')
+             
+         }
+         #预热活动开始前用户打标         
+        
+        dau_users_mark1 <- dau_original %>%
+            mutate(user_id = as.numeric(user_id)) %>%
+            left_join(users_mark_data2, by = c('user_id' =  'webuser_id','activity', 'vender_id')) %>%
+            mutate(mark = ifelse(is.na(mark), 'new_user', mark)) %>%
+            select(activity, vender_id, user_id, receive_date, mark) %>%
+            filter(!is.na(user_id))
+        
+        coupon_users_mark1 <- click_coupon_users_original %>%
+            left_join(users_mark_data2, by = c('user_id' =  'webuser_id', 'activity', 'vender_id')) %>%
+            mutate(mark = ifelse(is.na(mark), 'new_user', mark)) %>%
+            select(activity, vender_id, user_id, create_dat, mark)
+
+        if (i == 1) {
+            
+            fwrite(dau_users_mark1, file = 'dau_users_mark1.csv')
+            fwrite(coupon_users_mark1, file = 'coupon_users_mark1.csv')
+            
+            
+        } else {
+            
+            fwrite(dau_users_mark1, file = 'dau_users_mark1.csv', append = T, showProgress = F)
+            fwrite(coupon_users_mark1, file = 'coupon_users_mark1.csv', append = T, showProgress = F)
+           
+        }
+        
+    }
+   
+} 
+
+# 全部的数据
+dau_users_mark1 <- fread('dau_users_mark1.csv', na.strings = '', encoding = 'UTF-8', showProgress = F) %>%
+    unique() %>%
+    left_join(vender_name, by = c("vender_id" = 'id'))
+coupon_users_mark1 <- fread('coupon_users_mark1.csv', na.strings = '', 
+                            encoding = 'UTF-8',showProgress = F) %>%
+    unique() %>%
+    left_join(vender_name, by = c("vender_id" = 'id'))
+# 
+# dau_users_mark1 %>%
+#     summarise(max_vender_id = max(vender_id),
+#               max_date = max(receive_date))
+
+# coupon_users_mark1 %>%
+#     summarise(max_vender_id = max(vender_id),
+#               max_date = max(create_dat))
+```
+
+```{r}
+#可以下载的table
+buildDTtable <- function(df, table.caption, page_len = 10){
+                         #page_len = 10){ 
+    # df_name = deparse(substitute(df)) 
+    DT.table = DT::datatable(
+        df,   
+        caption = table.caption, filter = 'top',   
+        extensions = 'Buttons',
+        escape = FALSE,
+        rownames = TRUE,
+        options = list(dom = 'Blfrtip',
+                       pageLength = page_len, 
+                       lengthMenu = c(5, 10, 15, 20, 50), 
+                       buttons = 
+                           list('colvis', list(
+                               extend = 'collection',
+                               buttons = list(list(extend='csv',
+                                                   filename = table.caption),
+                                              list(extend='excel',
+                                                   filename = table.caption),
+                                              list(extend='pdf',
+                                                   filename= table.caption)),
+                               text = 'Download'
+                           )),
+                        scrollX = TRUE,
+                        scrollY = TRUE
+                       #  pageLength = nrow(fullData),
+                       #  order=list(list(2,'desc'))))
+        )
+        )
+    return(DT.table) 
+}
+```
+
+
+# 预热期间基本信息
+
+`r activities$activity[1]`预热活动情况如下表所示。其中activity为预热活动名称，vender_id为商家id，start为预热开始时间，end为预热结束时间。
+
+```{r}
+buildDTtable(activities %>%
+                  left_join(vender_name, by = c("vender_id" = 'id')) %>%
+                  select(activity, vender_id, vender_name, start, end) %>%
+                  unique(), '各商家预热活动开始时间')
+```
+
+
+优惠券种类的具体情况如下表所示。
+
+```{r}
+coupon_detail <- read_excel('coupon_detail.xlsx') %>%
+     left_join(vender_name, by = c("vender_id" = 'id')) %>%
+     select(activity, vender_id, vender_name, name, 'quota-value')
+buildDTtable(coupon_detail, '各商家优惠券详情')
+```
+
+
+
+# 预热期间的DAU、领券数量、领取率
+
+DAU计算的是除page_title为'click_address','click_message', 'click_all','自由购', '会员码','扫一扫',event_code中除'app_push_reach','wxmini_pv', 'wxmini_click'外的所有点击行为的用户数。
+
+## 按天计算
+
+每天的DAU，按天对用户不重复计数。一个用户一个预热活动不同天内领券，会计算两次。每天的领券用户计算类似DAU。
+
+```{r}
+day_dau <- dau_users_mark1 %>%
+    group_by(activity, vender_name, receive_date) %>%
+    summarise(users_cnt = n_distinct(user_id)) %>%
+    ungroup() 
+```
+
+**DAU和领取人数的散点图**
+
+下表中"fos"为当天的领券完成进度。
+
+```{r}
+#每天的领券目标
+target <- read_excel("target.xlsx") %>%
+    mutate(warm_up_date = ymd(warm_up_date))
+
+day_coupon_users <- coupon_users_mark1 %>%
+    group_by(activity, vender_name, create_dat) %>%
+    summarise(coupon_users_cnt = n_distinct(user_id))
+
+day_dau_coupon <-  day_coupon_users %>%
+    left_join(day_dau, by = c('activity', 'vender_name', 'create_dat' = 'receive_date')) %>%
+    mutate(transrate = sprintf('%.1f%%',coupon_users_cnt/users_cnt*100)) %>%
+    group_by(activity,vender_name) %>%
+    mutate(day_order = 1:length(activity),
+           create_dat1 = ymd(create_dat)) %>%
+    ungroup() %>%
+    left_join(vender_name, by = 'vender_name') %>%
+    left_join(target, by = c('id' = 'vender_id', 'create_dat1' = 'warm_up_date')) %>%
+    mutate(fos = sprintf("%.1f%%", coupon_users_cnt/pre_by_day*100),
+           fos1 = coupon_users_cnt/pre_by_day) 
+   
+    
+buildDTtable(day_dau_coupon %>%
+                 select(-c(create_dat1, id, pre_by_day, pre_cusum, pre_fos,
+                           fos1, target)), '每天的UV和领券人数')
+
+
+#DAU和领取人数的散点图
+ggplotly(
+ggplot(day_dau_coupon, aes(x = users_cnt/10000, y = coupon_users_cnt/10000, text = create_dat)) +
+    geom_point(aes(colour = vender_name)) +
+    # theme(axis.title.x = element_blank(),
+    #       axis.text.x = element_blank(),
+    #       axis.ticks.x = element_blank()) +
+    ggtitle('领取人数/DAU') +
+    xlab('UV/万人') + ylab('领取人数/万人') + facet_wrap(~ vender_name,nrow = 4, scales = 'fix'),
+tooltip = c('x','y','text','vender_name')
+
+)
+
+```
+
+**每天领券任务的完成率**
+
+```{r}
+ggplotly(
+ggplot(day_dau_coupon, aes(x = create_dat, y = fos1, group = vender_name, text = fos)) + 
+    geom_line(aes(color = vender_name)) +
+    scale_y_continuous(labels = percent) +
+    xlab("date") + ylab("fos") +
+    # geom_text(aes(label = fos)) +
+    theme(
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank()),
+tooltip = c("x", 'fos', 'group')
+)
+```
+
+
+## 按天去重累计计算
+
+以上按天计算会受到用户多次领券的影响，无法知道每天实际新增的领券用户数。为了剔除多次领券用户的影响，计算按天去重累计的用户数。
+
+**UV**
+
+每个预热活动按天去重累计的UV，如果某个用户再一个预热活动内多次领券，只会算在第一次领券的那天。
+
+
+```{r}
+cumsum_day_dau <- dau_users_mark1 %>%
+    group_by(activity, vender_name, user_id) %>%
+    summarise(min_receive_date = min(receive_date)) %>%
+    group_by(activity, vender_name,  min_receive_date) %>%
+    summarise(users_cnt = n_distinct(user_id)) %>%
+    group_by(activity, vender_name) %>%
+    mutate(cumsum_users_cnt = cumsum(users_cnt))
+
+```
+
+**累计去重领取人数和累计领取率**
+
+```{r}
+cumsum_coupon_users <- coupon_users_mark1 %>%
+        group_by(activity, vender_name, user_id) %>%
+        summarise(min_create_date = min(create_dat)) %>%
+        group_by(activity, vender_name, min_create_date) %>%
+        summarise(coupon_users_cnt = n_distinct(user_id)) %>%
+        group_by(activity, vender_name) %>%
+        mutate(cumsum_coupon_users_cnt = cumsum(coupon_users_cnt)) %>%
+        ungroup() 
+        
+
+cumsum_dau_coupon <-  cumsum_coupon_users %>%
+    left_join(cumsum_day_dau, by = c('activity'= 'activity', 
+                                     'vender_name' = 'vender_name', 
+                                     'min_create_date' = 'min_receive_date')) %>%
+    mutate(transrate = sprintf('%.1f%%',cumsum_coupon_users_cnt/cumsum_users_cnt*100),
+           transrate1 = cumsum_coupon_users_cnt/cumsum_users_cnt)
+
+buildDTtable(cumsum_dau_coupon %>%
+                  select(activity,vender_name, min_create_date, cumsum_coupon_users_cnt, cumsum_users_cnt, transrate),'累计的UV和领券人数')
+
+#累计领取人数
+ggplotly(
+ggplot(cumsum_dau_coupon %>%
+           group_by(activity, vender_name) %>%
+           mutate(day_order = 1:length(activity))
+           , aes(x = day_order, y = cumsum_coupon_users_cnt)) +
+    geom_line(aes(group = vender_name, colour = vender_name)) +
+    ggtitle('累计领取人数')
+
+)
+
+#累计领取率
+
+ggplotly(
+ggplot(cumsum_dau_coupon %>%
+           group_by(activity, vender_name) %>%
+           mutate(day_order = 1:length(activity)),
+       aes(x = day_order, y = transrate1)) +
+    geom_line(aes(group = vender_name, colour =vender_name)) +
+    ggtitle('累计领取率'))
+
+
+```
+
+## 按活动计算
+
+下表中‘coupon_user_cnt’为活动期间领券人数，‘users_cnt’为活动期间UV，‘transrate’为领券人数占UV的比例，‘target’为领券的目标值，‘fos’为已经领券人数占目标领券人数的比例，‘pre_fos1’为‘fos’的预估值。
+
+```{r}
+period_dau <- dau_users_mark1 %>%
+    group_by(activity, vender_id, vender_name) %>%
+    summarise(users_cnt = n_distinct(user_id)) %>%
+    ungroup() 
+
+period_coupon_users <- coupon_users_mark1 %>%
+    group_by(activity, vender_id, vender_name) %>%
+    summarise(coupon_users_cnt = n_distinct(user_id)) %>%
+    ungroup()
+
+period_target <- target %>%
+    filter(warm_up_date == Sys.Date())
+
+period_dau_coupon <- period_coupon_users %>%
+    left_join(period_dau, by = c('activity', 'vender_name', 'vender_id')) %>%
+    mutate(transrate = sprintf('%.1f%%',coupon_users_cnt/users_cnt*100),
+           transrate1 = coupon_users_cnt/users_cnt) %>%
+    left_join(period_target, by = 'vender_id') %>%
+    mutate(fos = sprintf('%.1f%%', coupon_users_cnt/target*100),
+           pre_fos1 = sprintf('%.1f%%',pre_fos*100)) %>%
+    mutate(balance = coupon_users_cnt/target - pre_fos)
+
+
+
+buildDTtable(period_dau_coupon %>%
+                  select(-c(transrate1, vender_id, warm_up_date, pre_by_day, pre_fos,
+                            pre_cusum, balance )), '按活动计算的领券率')
+
+ggplotly(
+ggplot(period_dau_coupon, aes(x = factor(vender_id), y = transrate1)) + 
+    geom_bar(stat = 'identity', aes(fill = vender_name)) +
+    # theme(axis.title.x = element_blank(),
+    #       axis.text.x = element_blank(),
+    #       axis.ticks.x = element_blank()) +
+    scale_y_continuous(labels = percent) + geom_text(aes(label = transrate)) +
+    xlab('vender_id') +
+    geom_hline(yintercept = sum(period_dau_coupon$coupon_users_cnt)/sum(period_dau_coupon$users_cnt)),
+tooltip = c("vender_name")
+    
+) 
+```
+
+
+**预热活动的平均领取率是：`r sprintf('%.1f%%',sum(period_dau_coupon$coupon_users_cnt)/sum(period_dau_coupon$users_cnt)*100)`**。  
+请重点关注领取率低于平均值的商家。
+
+
+**累计领券目标达成**
+
+y轴是‘fos-pre_fos1’的值（balance）。
+
+```{r}
+ggplotly(
+ggplot(period_dau_coupon, aes(x = factor(vender_id), y = balance))+
+    geom_bar(stat = 'identity', aes(fill = vender_name)) +
+    xlab("vender_id")
+    
+    ,
+tooltip = c('fill', 'y', 'text')
+)
+
+```
+
+## 重点用户领券情况
+
+重点用户指预热活动开始前有过线上订单的用户。
+
+这里以每个商家预热开始的当天为基期，将有过线上单的用户最后一次订单时间与基期相减，然后再按照0-30，31-60，61-90,90天以上对用户进行划分，计算不同分组用户中领券用户的占比。
+
+
+```{r}
+#90天用户的总数
+finnal_users_mark  <- users_mark_data2 %>%
+    group_by(activity, vender_id, vender_name, mark) %>%
+    summarise(total_users_cnt = n_distinct(webuser_id)) %>%
+    ungroup() 
+
+#活动期间90天内用户的领券情况
+old_users_coupon <- coupon_users_mark1 %>%
+    mutate(users_groups = mark) %>%
+    group_by(activity, vender_id, vender_name, users_groups) %>%
+    summarise(coupon_users_cnt = n_distinct(user_id)) %>%
+    left_join(finnal_users_mark, by = c('activity', 'vender_name','vender_id', 'users_groups' = 'mark')) %>%
+    mutate(rate = sprintf('%.1f%%',coupon_users_cnt/total_users_cnt*100),
+           rate1 = coupon_users_cnt/total_users_cnt)
+
+buildDTtable(old_users_coupon %>%
+                  filter(users_groups != 'new_user') %>%
+                  select(-rate1), '重点用户的领券情况')
+
+mean_old_users <- old_users_coupon %>%
+    filter(users_groups != 'new_user') %>%
+    group_by(users_groups) %>%
+    summarise(total_coupon = sum(coupon_users_cnt),
+              total_users = sum(total_users_cnt)) %>%
+    ungroup() %>%
+    mutate(mean_rate = total_coupon/total_users) %>%
+    select(users_groups, mean_rate)
+
+ggplotly(
+ggplot(old_users_coupon %>% filter(users_groups != 'new_user'),
+       aes(x = factor(vender_id), y = rate1, text = rate)) + 
+    geom_bar(stat = 'identity', aes(fill = vender_name)) + 
+    scale_y_continuous(labels = percent) +
+    xlab('vender_id') +
+    facet_wrap(~users_groups) +
+    geom_hline(aes(yintercept = mean_rate), mean_old_users),
+tooltip = c('vender_name','rate')
+    
+)
+
+```
+
+## 新用户领券情况
+
+```{r}
+#预热期间新用户数
+total_newusers <- dau_users_mark1 %>%
+    filter(mark == 'new_user')%>%
+    group_by(activity, vender_id, vender_name, mark) %>%
+    summarise(total_users_cnt = n_distinct(user_id)) %>%
+    ungroup()
+
+new_user_coupon <- coupon_users_mark1 %>%
+    filter(mark == 'new_user')%>%
+    group_by(activity, vender_name, vender_id, mark) %>%
+    summarise(coupon_users_cnt = n_distinct(user_id)) %>%
+    left_join(total_newusers, by = c('activity', 'vender_name', 'vender_id', 'mark')) %>%
+    mutate(rate = sprintf('%.1f%%',coupon_users_cnt/total_users_cnt*100),
+           rate1 = coupon_users_cnt/total_users_cnt)
+
+buildDTtable(new_user_coupon %>%
+                  select(-rate1),'新用户的领券情况')
+
+ggplotly(
+ggplot(new_user_coupon,
+       aes(x = factor(vender_id), y = rate1, text = rate)) + 
+    geom_bar(stat = 'identity', aes(fill = vender_name)) + 
+    scale_y_continuous(labels = percent) +
+    geom_text(aes(label = rate)) +
+    xlab('vender_id') +
+    geom_hline(yintercept =  sum(new_user_coupon$coupon_users_cnt)/sum(new_user_coupon$total_users_cnt)),
+tooltip = c('vender_name','rate')
+    
+)
+
+
+```
+
+## 领券用户中不同组用户占比
+
+```{r}
+# library(RColorBrewer)
+ggplotly(
+ggplot(old_users_coupon, 
+       aes(x = factor(vender_id),
+           y = coupon_users_cnt,
+           text = vender_name)) + 
+    geom_bar(stat = 'identity', aes(fill = users_groups), position = 'fill') +  
+    xlab('vender_id') +
+    scale_fill_brewer(type = 'div', palette = 'Oranges') +
+    scale_y_continuous(labels = percent),
+tooltip = c('y', 'fill', 'vender_name')
+)
+
+```
